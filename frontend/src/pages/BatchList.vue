@@ -303,9 +303,13 @@ async function removeBatch(row: BatchRow): Promise<void> {
   if (!confirmed) return
   const cellarIds = cellars.map((cellar) => cellar.id)
   const tastingIds = await db.tastings.where('batchId').equals(row.batch.id).primaryKeys()
-  await db.transaction('rw', [db.batches, db.cellars, db.tastings], async () => {
+  await db.transaction('rw', [db.batches, db.cellars, db.cellarDrafts, db.tastings], async () => {
     await db.tastings.bulkDelete(tastingIds)
     await db.cellars.bulkDelete(cellarIds)
+    if (cellarIds.length > 0) {
+      const draftIds = await db.cellarDrafts.where('cellarId').anyOf(cellarIds).primaryKeys()
+      if (draftIds.length > 0) await db.cellarDrafts.bulkDelete(draftIds)
+    }
     await db.batches.delete(row.batch.id)
   })
   ElMessage.success(`已删除批次，连带清除窖藏 ${cellarIds.length} 条、品香 ${tastingIds.length} 条`)

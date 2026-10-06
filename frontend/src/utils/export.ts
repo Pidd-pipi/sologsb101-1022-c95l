@@ -21,6 +21,7 @@ import { PROPORTION_ROLES, type Proportion, type ProportionRole } from '@/types/
 import { FORMING_METHODS, type Batch, type FormingMethod } from '@/types/batch'
 import { CELLAR_CONTAINERS, CELLAR_STATES, type Cellar, type CellarState, type CellarContainer } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import { revisionFromStartDate } from '@/utils/cellarSync'
 
 /** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香 */
 export interface FormulaExportPayload {
@@ -329,15 +330,20 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       errors.push(`cellars[${index}] batchId 无法对应到本次导入的批次`)
       return
     }
+    const startDate = asString(raw.startDate, new Date().toISOString().slice(0, 10))
     cellars.push({
       id: asString(raw.id, createId('cellar')),
       batchId,
-      startDate: asString(raw.startDate, new Date().toISOString().slice(0, 10)),
+      startDate,
       endDate: asString(raw.endDate, new Date().toISOString().slice(0, 10)),
       temperatureC: asNumber(raw.temperatureC, 22),
       humidityPct: asNumber(raw.humidityPct, 60),
       container: pickEnum<CellarContainer>(raw.container, CELLAR_CONTAINER_SET, '陶罐'),
       state: pickEnum<CellarState>(raw.state, CELLAR_STATE_SET, '窖藏中'),
+      // 旧版导出文件没有修订号：按入窖日期补迁移
+      revision: asNumber(raw.revision, revisionFromStartDate(startDate)),
+      origin: asString(raw.origin, 'imported'),
+      ...(typeof raw.forkOf === 'string' && raw.forkOf.length > 0 ? { forkOf: raw.forkOf } : {}),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -391,7 +397,7 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
   }
 }
 
-/** 校验全量快照 JSON */
+/** 校验全量快照 JSON；窖藏旧数据缺修订号时按入窖日期就地补迁移 */
 export function validateSnapshotJson(input: unknown): ValidateResult<IncenseSnapshot> {
   const errors: string[] = []
   if (!isRecord(input)) return { ok: false, errors: ['文件内容不是合法的 JSON 对象'], payload: null }
@@ -402,6 +408,14 @@ export function validateSnapshotJson(input: unknown): ValidateResult<IncenseSnap
   })
   if (errors.length > 0) return { ok: false, errors, payload: null }
   const snapshot = input as unknown as IncenseSnapshot
+  snapshot.cellars = snapshot.cellars.map((cellar) => ({
+    ...cellar,
+    revision:
+      typeof cellar.revision === 'number' && Number.isFinite(cellar.revision) && cellar.revision > 0
+        ? Math.floor(cellar.revision)
+        : revisionFromStartDate(cellar.startDate),
+    origin: typeof cellar.origin === 'string' && cellar.origin.length > 0 ? cellar.origin : 'imported'
+  }))
   return { ok: true, errors: [], payload: snapshot }
 }
 
@@ -447,12 +461,18 @@ export async function importFormulaPayload(
   })
   const cellars: Cellar[] = payload.cellars
     .filter((cellar) => batchIdMap.has(cellar.batchId))
-    .map((cellar) => ({
-      ...cellar,
-      id: createId('cellar'),
-      batchId: batchIdMap.get(cellar.batchId) as string,
-      updatedAt: now
-    }))
+    .map((cellar) => {
+      // 导入的是新档案副本：冲突分叉关系属于源库，落库时剥离 forkOf
+      const { forkOf: _forkOf, ...rest } = cellar
+      void _forkOf
+      return {
+        ...rest,
+        id: createId('cellar'),
+        batchId: batchIdMap.get(cellar.batchId) as string,
+        origin: `imported:${now}`,
+        updatedAt: now
+      }
+    })
   const tastings: Tasting[] = payload.tastings
     .filter((tasting) => batchIdMap.has(tasting.batchId))
     .map((tasting) => ({

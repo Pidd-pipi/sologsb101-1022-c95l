@@ -17,6 +17,10 @@ import {
   CELLAR_CONTAINERS,
   CELLAR_NEAR_DAYS,
   CELLAR_STATES,
+  HUMIDITY_HARD_MAX,
+  HUMIDITY_HARD_MIN,
+  TEMP_HARD_MAX,
+  TEMP_HARD_MIN,
   type Cellar,
   type CellarContainer,
   type CellarFilterState,
@@ -110,6 +114,23 @@ const {
   rows: ratioRows
 } = useProportion({ formulaId: watchedFormulaId })
 
+/** 所选容器的窖容余量：提交前核对，容量不足直接拒绝入窖（编辑时排除自身占用） */
+const selectedBatchQuantity = computed(
+  () => batchTable.rows.value.find((batch) => batch.id === form.batchId)?.quantity ?? 0
+)
+const capacityPreview = computed(() => {
+  const stat = cellarStore.containerCapacityOf(form.container)
+  const self = editingId.value ? cellarStore.cellarById(editingId.value) : null
+  if (self && self.state === '窖藏中' && self.container === form.container) {
+    const selfQty = batchTable.rows.value.find((batch) => batch.id === self.batchId)?.quantity ?? 0
+    return { ...stat, used: Math.max(0, stat.used - selfQty), remain: stat.remain + selfQty }
+  }
+  return stat
+})
+const capacityShort = computed(
+  () => form.state === '窖藏中' && capacityPreview.value.remain < selectedBatchQuantity.value
+)
+
 const filterModel = computed<FilterModel>(() => ({
   keyword: cellarStore.filter.keyword,
   state: cellarStore.filter.states,
@@ -162,10 +183,10 @@ watch(
   }
 )
 
-/** 未入窖的批次，供新建窖藏时选择 */
+/** 未入窖的批次，供新建窖藏时选择（冲突分叉不计入占用） */
 const availableBatches = computed(() =>
   batchTable.rows.value.filter((batch) => {
-    if (editingId.value && batch.id === editingId.value) return true
+    if (editingId.value && batch.id === cellarStore.cellarById(editingId.value)?.batchId) return true
     return cellarStore.cellarsOfBatch(batch.id).length === 0
   })
 )
@@ -257,14 +278,34 @@ function openEdit(cellar: Cellar): void {
   dialogVisible.value = true
 }
 
+/** 冲突留版只允许查看，不能再就地覆盖主版本 */
+const viewingFork = computed(() => {
+  const cellar = editingId.value ? cellarStore.cellarById(editingId.value) : null
+  return Boolean(cellar?.forkOf)
+})
+
 async function submitForm(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+  // 提交前核对容器余量与温湿度边界：容量不足 / 越界直接拒绝入窖
+  const editing = editingId.value ? cellarStore.cellarById(editingId.value) : null
+  const preflight = cellarStore.preflightSubmission({
+    cellarId: editingId.value ?? 'cellar_pending',
+    batchId: form.batchId,
+    container: form.container,
+    state: form.state,
+    temperatureC: form.temperatureC,
+    humidityPct: form.humidityPct
+  })
+  if (preflight) {
+    ElMessage.error(preflight)
+    return
+  }
   submitting.value = true
   try {
-    if (editingId.value) {
-      await cellarStore.updateCellar(editingId.value, {
+    if (editing) {
+      const result = await cellarStore.updateCellar(editing.id, {
         batchId: form.batchId,
         startDate: form.startDate,
         endDate: form.endDate,
@@ -273,9 +314,15 @@ async function submitForm(): Promise<void> {
         container: form.container,
         state: form.state
       })
-      ElMessage.success('窖藏环境记录已更新')
+      // 离线合并被拒绝：草稿保留，到「离线草稿」面板重试
+      if (result.status === 'failed') {
+        ElMessage.warning(result.error ?? '改动已存为离线草稿，可在草稿面板重试')
+      } else {
+        ElMessage.success('窖藏环境记录已更新')
+        dialogVisible.value = false
+      }
     } else {
-      await cellarStore.createCellar({
+      const result = await cellarStore.createCellar({
         batchId: form.batchId,
         startDate: form.startDate,
         endDate: form.endDate,
@@ -284,9 +331,16 @@ async function submitForm(): Promise<void> {
         container: form.container,
         state: form.state
       })
-      ElMessage.success('已登记窖藏批次，临近出窖会自动提醒')
+      if (result.status === 'failed') {
+        ElMessage.warning(result.error ?? '入窖已存为离线草稿，可在草稿面板重试')
+      } else {
+        ElMessage.success('已登记窖藏批次，临近出窖会自动提醒')
+        dialogVisible.value = false
+      }
     }
-    dialogVisible.value = false
+  } catch (err) {
+    // 预检拦截：不产生草稿；其它失败时草稿仍在队列里，可重试
+    ElMessage.error(err instanceof Error ? err.message : '提交失败，草稿已保留，可稍后重试')
   } finally {
     submitting.value = false
   }
@@ -306,14 +360,25 @@ async function setState(row: CellarRow, state: CellarState): Promise<void> {
 async function updateReading(row: CellarRow, field: 'temperatureC' | 'humidityPct', value: number): Promise<void> {
   const next = round(value, 1)
   if (next === row.cellar[field]) return
-  await cellarStore.updateCellar(row.cellar.id, { [field]: next } as Partial<Cellar>)
+  // 有效读数改动走离线草稿队列；越界 / 容量不足时草稿保留并提示重试
+  let result: { status: 'applied' | 'failed'; error: string | null }
+  try {
+    result = await cellarStore.updateCellar(row.cellar.id, { [field]: next } as Partial<Cellar>)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '读数提交失败，草稿已保留')
+    return
+  }
+  if (result.status === 'failed') {
+    ElMessage.warning(`${result.error ?? '读数已存为离线草稿'}（可在草稿面板重试）`)
+    return
+  }
   const outOfRange = field === 'temperatureC' ? next < 18 || next > 26 : next < 50 || next > 70
   ElMessage({
     type: outOfRange ? 'warning' : 'success',
     message:
       field === 'temperatureC'
-        ? `温度已记录 ${next} ℃${outOfRange ? '（超出 18~26 ℃ 建议区间）' : ''}`
-        : `湿度已记录 ${next}%${outOfRange ? '（超出 50~70% 建议区间）' : ''}`
+        ? `温度已记录 ${next} ℃（修订号已自增）${outOfRange ? '（超出 18~26 ℃ 建议区间）' : ''}`
+        : `湿度已记录 ${next}%（修订号已自增）${outOfRange ? '（超出 50~70% 建议区间）' : ''}`
   })
 }
 
@@ -337,6 +402,49 @@ async function releaseOverdue(): Promise<void> {
   ElMessage.success(`已将 ${count} 个逾期批次置为「已出窖」`)
 }
 
+/** 离线草稿面板：断网回来逐条重试；失败草稿也保留在此 */
+async function retryAllDrafts(): Promise<void> {
+  const result = await cellarStore.retryDrafts()
+  if (result.applied > 0) ElMessage.success(`已合并 ${result.applied} 条离线草稿`)
+  if (result.failed > 0) ElMessage.warning(`${result.failed} 条草稿仍被拒绝（容量不足 / 越界），草稿已保留`)
+  if (result.applied === 0 && result.failed === 0) ElMessage.info('没有待提交的草稿')
+}
+
+async function retryDraft(id: string): Promise<void> {
+  const result = await cellarStore.retryDrafts([id])
+  if (result.applied > 0) ElMessage.success('草稿已合并')
+  else ElMessage.warning('草稿仍被拒绝，已保留可再次重试')
+}
+
+async function discardDraft(id: string): Promise<void> {
+  const confirmed = await ElMessageBox.confirm('放弃这条离线草稿？对应的入窖 / 读数改动会丢弃。', '放弃草稿', {
+    type: 'warning',
+    confirmButtonText: '放弃',
+    cancelButtonText: '取消'
+  }).catch(() => false)
+  if (!confirmed) return
+  await cellarStore.discardDraft(id)
+  ElMessage.success('草稿已放弃')
+}
+
+function draftActionLabel(action: string): string {
+  return action === 'create' ? '入窖登记' : '窖藏修改'
+}
+
+function healthTone(health: CellarRow['health']): 'success' | 'warning' | 'danger' | 'info' {
+  if (health === 'done') return 'success'
+  if (health === 'bad') return 'danger'
+  if (health === 'warn') return 'warning'
+  return 'info'
+}
+
+function healthLabel(health: CellarRow['health']): string {
+  if (health === 'done') return '已出窖'
+  if (health === 'bad') return '读数越界'
+  if (health === 'warn') return '区间外'
+  return '环境适宜'
+}
+
 async function goTasting(row: CellarRow): Promise<void> {
   await db.batches.update(row.cellar.batchId, { updatedAt: Date.now() })
   void router.push({ path: '/tastings', query: { batch: row.cellar.batchId } })
@@ -355,6 +463,7 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           共 {{ cellarStore.cellars.length }} 条窖藏记录 · 在窖 {{ cellarStore.agingCount }} 个 · 待提醒
           {{ cellarStore.alerts.length }} 个 · 均温 {{ cellarStore.averageTemperature }} ℃ / 均湿
           {{ cellarStore.averageHumidity }}%
+          <template v-if="cellarStore.forkCount > 0"> · 冲突留版 {{ cellarStore.forkCount }} 条</template>
         </p>
       </div>
       <div class="page-title__actions">
@@ -408,6 +517,43 @@ const formingText = (batchId: string): FormingMethod | '—' =>
       :title="`环境超限 ${cellarStore.environmentWarning.length} 条（建议 18~26 ℃ / 50~70%）`"
     />
 
+    <el-alert
+      v-if="cellarStore.hasDrafts"
+      class="cellar-alert"
+      :type="cellarStore.failedDrafts.length > 0 ? 'error' : 'warning'"
+      show-icon
+      :closable="false"
+      :title="`离线草稿 ${cellarStore.drafts.length} 条（待提交 ${cellarStore.pendingDrafts.length} · 失败 ${cellarStore.failedDrafts.length}）`"
+    >
+      <template #default>
+        <div class="draft-box">
+          <div v-for="draft in cellarStore.drafts" :key="draft.id" class="draft-item">
+            <el-tag :type="draft.status === 'failed' ? 'danger' : 'warning'" size="small" effect="plain">
+              {{ draftActionLabel(draft.action) }}
+            </el-tag>
+            <span class="draft-label">{{ draft.batchLabel }}</span>
+            <span class="muted">修订 r{{ draft.base?.revision ?? '新' }} → r{{ draft.next.revision }}</span>
+            <span v-if="draft.lastError" class="draft-error">{{ draft.lastError }}</span>
+            <el-button
+              size="small"
+              type="primary"
+              text
+              :loading="cellarStore.flushing"
+              @click="retryDraft(draft.id)"
+            >
+              重试
+            </el-button>
+            <el-button size="small" type="danger" text @click="discardDraft(draft.id)">放弃</el-button>
+          </div>
+          <div class="draft-actions">
+            <el-button size="small" type="primary" plain :loading="cellarStore.flushing" @click="retryAllDrafts">
+              断网恢复后一键合并全部草稿
+            </el-button>
+          </div>
+        </div>
+      </template>
+    </el-alert>
+
     <FilterBar
       :model-value="filterModel"
       :selects="filterSelects"
@@ -431,13 +577,20 @@ const formingText = (batchId: string): FormingMethod | '—' =>
       </div>
 
       <el-table v-else :data="rows" row-key="cellar.id" stripe>
-        <el-table-column label="批次 / 香方" min-width="210">
+        <el-table-column label="批次 / 香方" min-width="230">
           <template #default="{ row }: { row: CellarRow }">
-            <div class="cell-main">{{ row.formulaName }}</div>
+            <div class="cell-main">
+              {{ row.formulaName }}
+              <el-tag v-if="row.isFork" size="small" type="danger" effect="plain" round>冲突留版</el-tag>
+              <el-tag v-else-if="row.versions.length > 0" size="small" type="warning" effect="plain" round>
+                {{ row.versions.length }} 版并存
+              </el-tag>
+            </div>
             <div class="cell-sub muted">
               {{ formingText(row.cellar.batchId) }} · {{ row.quantity }} 支 · 配比
               {{ batchFormulaMaterialCount(row.cellar.batchId) }} 味
             </div>
+            <div v-if="row.isFork" class="cell-sub muted">保留自主版本：{{ row.parentLabel }}</div>
           </template>
         </el-table-column>
         <el-table-column label="窖藏天数" width="150">
@@ -457,12 +610,13 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           <template #default="{ row }: { row: CellarRow }">
             <el-input-number
               :model-value="row.cellar.temperatureC"
-              :min="-10"
-              :max="50"
+              :min="TEMP_HARD_MIN"
+              :max="TEMP_HARD_MAX"
               :step="0.5"
               :precision="1"
               size="small"
               controls-position="right"
+              :disabled="row.isFork"
               style="width: 108px"
               @change="(value: number | undefined) => updateReading(row, 'temperatureC', value ?? 0)"
             />
@@ -472,28 +626,38 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           <template #default="{ row }: { row: CellarRow }">
             <el-input-number
               :model-value="row.cellar.humidityPct"
-              :min="0"
-              :max="100"
+              :min="HUMIDITY_HARD_MIN"
+              :max="HUMIDITY_HARD_MAX"
               :step="1"
               :precision="1"
               size="small"
               controls-position="right"
+              :disabled="row.isFork"
               style="width: 108px"
               @change="(value: number | undefined) => updateReading(row, 'humidityPct', value ?? 0)"
             />
           </template>
         </el-table-column>
-        <el-table-column label="容器 / 状态" width="170">
+        <el-table-column label="容器 / 状态" width="200">
           <template #default="{ row }: { row: CellarRow }">
             <GradeTag plain size="small" :label="row.cellar.container" />
             <el-tag class="state-tag" :type="urgencyTone(row.urgency)" effect="plain" round>
               {{ row.cellar.state }}
             </el-tag>
+            <el-tooltip
+              :content="`修订号 r${row.cellar.revision} · 来源 ${row.cellar.origin}`"
+              placement="top"
+            >
+              <el-tag class="state-tag" size="small" :type="healthTone(row.health)" effect="plain">
+                {{ healthLabel(row.health) }}
+              </el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="270" fixed="right">
           <template #default="{ row }: { row: CellarRow }">
             <el-button
+              v-if="!row.isFork"
               size="small"
               type="warning"
               plain
@@ -501,7 +665,11 @@ const formingText = (batchId: string): FormingMethod | '—' =>
             >
               {{ row.cellar.state === '窖藏中' ? '出窖' : '回退为在窖' }}
             </el-button>
-            <el-dropdown trigger="click" @command="(command: string) => setState(row, command as CellarState)">
+            <el-dropdown
+              v-if="!row.isFork"
+              trigger="click"
+              @command="(command: string) => setState(row, command as CellarState)"
+            >
               <el-button size="small">状态</el-button>
               <template #dropdown>
                 <el-dropdown-menu>
@@ -512,15 +680,22 @@ const formingText = (batchId: string): FormingMethod | '—' =>
               </template>
             </el-dropdown>
             <el-button size="small" text @click="goTasting(row)">去品香</el-button>
-            <el-button size="small" text type="primary" :icon="Edit" @click="openEdit(row.cellar)">编辑</el-button>
+            <el-button size="small" text type="primary" :icon="Edit" @click="openEdit(row.cellar)">
+              {{ row.isFork ? '查看' : '编辑' }}
+            </el-button>
             <el-button size="small" text type="danger" :icon="Delete" @click="removeCellar(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
     </div>
 
-    <el-dialog v-model="dialogVisible" :title="editingId ? '编辑窖藏记录' : '登记窖藏批次'" width="580px" append-to-body>
-      <el-form ref="formRef" :model="form" :rules="rules" label-width="112px">
+    <el-dialog
+      v-model="dialogVisible"
+      :title="viewingFork ? '查看冲突留版' : editingId ? '编辑窖藏记录' : '登记窖藏批次'"
+      width="580px"
+      append-to-body
+    >
+      <el-form ref="formRef" :model="form" :rules="rules" label-width="112px" :disabled="viewingFork">
         <el-form-item label="和香批次" prop="batchId">
           <el-select v-model="form.batchId" filterable placeholder="选择未入窖的批次" style="width: 100%">
             <el-option v-for="item in batchOptions" :key="item.value" :label="item.label" :value="item.value" />
@@ -545,12 +720,26 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           />
         </el-form-item>
         <el-form-item label="温度 ℃" prop="temperatureC">
-          <el-input-number v-model="form.temperatureC" :min="-10" :max="50" :step="0.5" :precision="1" style="width: 180px" />
-          <span class="muted form-hint">建议 18 ~ 26 ℃</span>
+          <el-input-number
+            v-model="form.temperatureC"
+            :min="TEMP_HARD_MIN"
+            :max="TEMP_HARD_MAX"
+            :step="0.5"
+            :precision="1"
+            style="width: 180px"
+          />
+          <span class="muted form-hint">建议 18 ~ 26 ℃（硬边界 -10 ~ 50 ℃）</span>
         </el-form-item>
         <el-form-item label="湿度 %" prop="humidityPct">
-          <el-input-number v-model="form.humidityPct" :min="0" :max="100" :step="1" :precision="1" style="width: 180px" />
-          <span class="muted form-hint">建议 50 ~ 70 %</span>
+          <el-input-number
+            v-model="form.humidityPct"
+            :min="HUMIDITY_HARD_MIN"
+            :max="HUMIDITY_HARD_MAX"
+            :step="1"
+            :precision="1"
+            style="width: 180px"
+          />
+          <span class="muted form-hint">建议 50 ~ 70 %（硬边界 0 ~ 100 %）</span>
         </el-form-item>
         <el-form-item label="容器" prop="container">
           <el-radio-group v-model="form.container">
@@ -563,6 +752,17 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           </el-select>
         </el-form-item>
         <el-alert
+          v-if="form.batchId"
+          class="ratio-alert"
+          :type="capacityShort ? 'error' : 'success'"
+          :closable="false"
+          show-icon
+          :title="
+            `${form.container}窖容：已占 ${capacityPreview.used} / ${capacityPreview.limit}，余 ${capacityPreview.remain}；本批 ${selectedBatchQuantity} 支`
+          "
+          :description="capacityShort ? '容器余量不足，本次提交会被拒绝入窖：请更换容器或先出窖腾出空间。' : '余量充足，可以入窖。'"
+        />
+        <el-alert
           v-if="watchedFormulaId"
           class="ratio-alert"
           :type="ratioLevel === 'ok' ? 'success' : ratioLevel === 'warn' ? 'warning' : 'error'"
@@ -573,9 +773,15 @@ const formingText = (batchId: string): FormingMethod | '—' =>
         />
       </el-form>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submitForm">
-          {{ editingId ? '保存修改' : '登记入窖' }}
+        <el-button @click="dialogVisible = false">{{ viewingFork ? '关闭' : '取消' }}</el-button>
+        <el-button
+          v-if="!viewingFork"
+          type="primary"
+          :loading="submitting"
+          :disabled="capacityShort"
+          @click="submitForm"
+        >
+          {{ editingId ? '保存修改（离线合并）' : '登记入窖' }}
         </el-button>
       </template>
     </el-dialog>
@@ -621,5 +827,30 @@ const formingText = (batchId: string): FormingMethod | '—' =>
 
 .ratio-alert {
   margin-bottom: 12px;
+}
+
+.draft-box {
+  margin-top: 4px;
+}
+
+.draft-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.8;
+  flex-wrap: wrap;
+}
+
+.draft-label {
+  font-weight: 600;
+}
+
+.draft-error {
+  color: var(--el-color-danger);
+}
+
+.draft-actions {
+  margin-top: 4px;
 }
 </style>

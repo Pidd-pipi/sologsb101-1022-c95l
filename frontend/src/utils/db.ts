@@ -3,11 +3,12 @@ import type { Formula } from '@/types/formula'
 import type { Material } from '@/types/material'
 import type { Proportion } from '@/types/proportion'
 import type { Batch } from '@/types/batch'
-import type { Cellar } from '@/types/cellar'
+import type { Cellar, CellarDraft, CellarHealthSummary } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import { mergeCellarCollections, revisionFromStartDate, summarizeCellarHealth } from '@/utils/cellarSync'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -42,6 +43,8 @@ export interface IncenseSnapshot {
   batches: Batch[]
   cellars: Cellar[]
   tastings: Tasting[]
+  /** 窖藏状态汇总快照：由当前有效读数重算后随导出携带 */
+  cellarStatus?: CellarHealthSummary
 }
 
 export class IncenseDatabase extends Dexie {
@@ -50,6 +53,8 @@ export class IncenseDatabase extends Dexie {
   proportions!: Table<Proportion, string>
   batches!: Table<Batch, string>
   cellars!: Table<Cellar, string>
+  /** 离线窖藏草稿（失败保留、可重试） */
+  cellarDrafts!: Table<CellarDraft, string>
   tastings!: Table<Tasting, string>
 
   constructor() {
@@ -64,7 +69,7 @@ export class IncenseDatabase extends Dexie {
       tastings: 'id, batchId, tastedAt, smokeScore'
     })
     // v2：配比表补 seq 索引、批次与窖藏补日期索引，并回填历史脏数据
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
         materials: 'id, name, origin, grade, processMethod, updatedAt',
@@ -108,6 +113,31 @@ export class IncenseDatabase extends Dexie {
             }
           })
       })
+    // v3：窖藏补修订号 / 来源字段（旧数据修订号从入窖日期迁移），新增离线草稿表
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, updatedAt',
+        proportions: 'id, formulaId, materialId, role, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, container, revision, forkOf, updatedAt',
+        cellarDrafts: 'id, cellarId, action, status, createdAt, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 旧窖藏数据缺修订号：按入窖日期推导补齐，幂等且按时间单调
+        await tx
+          .table<Cellar>('cellars')
+          .toCollection()
+          .modify((cellar) => {
+            if (typeof cellar.revision !== 'number' || !Number.isFinite(cellar.revision) || cellar.revision <= 0) {
+              cellar.revision = revisionFromStartDate(cellar.startDate)
+            }
+            if (typeof cellar.origin !== 'string' || cellar.origin.length === 0) {
+              cellar.origin = 'legacy-migration'
+            }
+          })
+      })
   }
 }
 
@@ -123,7 +153,7 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.cellarDrafts, db.tastings],
     async () => {
       await Promise.all([
         db.formulas.clear(),
@@ -131,6 +161,7 @@ export async function clearAllTables(): Promise<void> {
         db.proportions.clear(),
         db.batches.clear(),
         db.cellars.clear(),
+        db.cellarDrafts.clear(),
         db.tastings.clear()
       ])
     }
@@ -139,15 +170,16 @@ export async function clearAllTables(): Promise<void> {
 
 /** 各表记录数汇总，品香页与状态徽标消费 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [formulas, materials, proportions, batches, cellars, tastings] = await Promise.all([
+  const [formulas, materials, proportions, batches, cellars, cellarDrafts, tastings] = await Promise.all([
     db.formulas.count(),
     db.materials.count(),
     db.proportions.count(),
     db.batches.count(),
     db.cellars.count(),
+    db.cellarDrafts.count(),
     db.tastings.count()
   ])
-  return { formulas, materials, proportions, batches, cellars, tastings }
+  return { formulas, materials, proportions, batches, cellars, cellarDrafts, tastings }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -190,7 +222,7 @@ export function readLastBackupAt(): string | null {
   return localStorage.getItem(LS_KEYS.lastBackupAt)
 }
 
-/** 组装本地全部数据的快照对象 */
+/** 组装本地全部数据的快照对象；窖藏状态汇总随当前读数重算 */
 export async function exportSnapshot(): Promise<IncenseSnapshot> {
   const [formulas, materials, proportions, batches, cellars, tastings] = await Promise.all([
     db.formulas.toArray(),
@@ -209,11 +241,16 @@ export async function exportSnapshot(): Promise<IncenseSnapshot> {
     proportions,
     batches,
     cellars,
-    tastings
+    tastings,
+    cellarStatus: summarizeCellarHealth(cellars)
   }
 }
 
-/** 按主键 bulkPut 写入快照；overwrite 为 true 时先清空全部表 */
+/**
+ * 按主键 bulkPut 写入快照；overwrite 为 true 时先清空全部表。
+ * 窖藏表不做整批覆盖：按批次逐条离线合并，同一条按修订号 / 时间留较新值，
+ * 双方都改过则留两版，库内独有的记录补进来。
+ */
 export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = false): Promise<void> {
   if (overwrite) await clearAllTables()
   await db.transaction(
@@ -224,7 +261,9 @@ export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = fals
       await db.materials.bulkPut(snapshot.materials)
       await db.proportions.bulkPut(snapshot.proportions)
       await db.batches.bulkPut(snapshot.batches)
-      await db.cellars.bulkPut(snapshot.cellars)
+      const localCellars = overwrite ? [] : await db.cellars.toArray()
+      const mergedCellars = mergeCellarCollections(localCellars, snapshot.cellars)
+      await db.cellars.bulkPut(mergedCellars)
       await db.tastings.bulkPut(snapshot.tastings)
     }
   )
@@ -414,6 +453,8 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 58,
       container: '陶罐',
       state: '窖藏中',
+      revision: revisionFromStartDate('2024-04-05'),
+      origin: 'seed',
       updatedAt: now
     },
     {
@@ -425,6 +466,8 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 62,
       container: '锡罐',
       state: '已出窖',
+      revision: revisionFromStartDate('2024-06-20'),
+      origin: 'seed',
       updatedAt: now
     }
   ]
@@ -464,6 +507,15 @@ export async function seedDatabase(): Promise<void> {
       await db.tastings.bulkPut(tastings)
     }
   )
+}
+
+/** 窖藏写库时修订号自增，保留来源标签页标识 */
+export function bumpCellarRevision(cellar: Cellar, origin = 'legacy-migration'): Cellar {
+  const baseRevision =
+    typeof cellar.revision === 'number' && Number.isFinite(cellar.revision) && cellar.revision > 0
+      ? cellar.revision
+      : revisionFromStartDate(cellar.startDate)
+  return { ...cellar, revision: baseRevision + 1, origin }
 }
 
 /** 首屏初始化：打开数据库并在香方表为空时自动播种演示档案 */

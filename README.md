@@ -93,7 +93,7 @@ sologsb101-1022/
         ├── pages/              # FormulaList.vue MaterialLib.vue ProportionBoard.vue
         │                       # BatchList.vue CellarView.vue TastingBoard.vue
         ├── router/index.ts
-        └── utils/              # ratio.ts db.ts export.ts
+        └── utils/              # ratio.ts db.ts export.ts cellarSync.ts（窖藏修订号 / 三路合并 / 容量与边界校验）
 ```
 
 | 路由 | 页面 | 主要职责 | 消费模型 |
@@ -102,7 +102,7 @@ sologsb101-1022/
 | `/materials` | 香料库与炮制 | 香料增删改、按等级/产地/炮制方式检索、就地改炮制方式、显示被哪些香方引用、清理闲置香料 | Material、Proportion |
 | `/proportions` | 配比与君臣佐使 | 君臣佐使编排、占比实时校验 100%、一键等比缩放与归一化、**HTML5 原生拖拽排序写回 `seq`**、按权重一键重排 | Proportion、Formula、Material |
 | `/batches` | 和香工序与成型 | 登记和香批次（自动固化配比快照）、快照与当前方子逐味对照、开批次前校验配比是否平衡 | Batch、Formula、Proportion |
-| `/cellar` | 窖藏与环境 | 入窖/出窖登记、温湿度就地录入、按剩余天数排序的临近出窖提醒、状态流转（窖藏中 → 已出窖）、批量处理逾期 | Cellar、Batch、Formula |
+| `/cellar` | 窖藏与环境 | 入窖/出窖登记、温湿度就地录入、**提交前核对容器余量与温湿度硬边界（容量不足拒绝入窖）**、按剩余天数排序的临近出窖提醒、状态流转（窖藏中 → 已出窖）、批量处理逾期、**多标签页按修订号逐条离线合并（冲突保留两版）与失败草稿重试** | Cellar、CellarDraft、Batch、Formula |
 | `/tastings` | 品香评鉴与导出 | 香韵 / 留香 / 烟气评分录入、同批次多次评鉴取均分并回写香方列表、结构版本查看、全量 JSON 导出与导入校验 | Tasting、Batch、全部模型 |
 
 `/` 与未匹配路径均重定向到 `/formulas`；页面组件全部懒加载，`router.afterEach` 同步 `document.title`。
@@ -112,7 +112,7 @@ sologsb101-1022/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbincense`（`frontend/src/utils/db.ts` 中的 `new IncenseDatabase()` → `super('gbincense')`）。
-- **结构版本号**：`export const DB_VERSION = 2`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
+- **结构版本号**：`export const DB_VERSION = 3`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
 
 | 表 | 主键与索引 | 说明 |
 | --- | --- | --- |
@@ -120,16 +120,24 @@ sologsb101-1022/
 | `materials` | `id, name, origin, grade, processMethod, updatedAt` | 香料库与炮制方式 |
 | `proportions` | `id, formulaId, materialId, role, seq, updatedAt` | 君臣佐使配比，`seq` 为拖拽编排顺序 |
 | `batches` | `id, formulaId, mixedAt, formingMethod, updatedAt` | 和香批次，含 `snapshot` 配比快照 |
-| `cellars` | `id, batchId, startDate, endDate, state, updatedAt` | 窖藏批次与环境读数 |
+| `cellars` | `id, batchId, startDate, endDate, state, container, revision, forkOf, updatedAt` | 窖藏批次与环境读数；`revision` 为修订号、`forkOf` 标记冲突保留的另一版 |
+| `cellarDrafts` | `id, cellarId, action, status, createdAt, updatedAt` | 窖藏离线草稿队列（断网先落本地，逐条合并；失败保留可重试） |
 | `tastings` | `id, batchId, tastedAt, smokeScore, updatedAt` | 品香评鉴 |
 
-- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(DB_VERSION).stores({...}).upgrade(async (tx) => {...})` 为真实迁移，会 `toCollection().modify(...)` 改写历史数据：
+- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(2)` 与 `version(DB_VERSION)` 均带真实迁移，会 `toCollection().modify(...)` 改写历史数据：
   1. 配比表补齐 `seq`（按 `formulaId` 分组顺序编号）与 `updatedAt`；
   2. 批次表补齐 `snapshot` 数组与 `snapshotAt`；
-  3. 品香表补齐 `lastingMin` 默认值。
+  3. 品香表补齐 `lastingMin` 默认值；
+  4. **v3：窖藏表补 `revision` 修订号（旧数据缺修订号时按入窖日期 `revisionFromStartDate` 推导，幂等且按时间单调）与 `origin` 来源标签，新增 `cellarDrafts` 离线草稿表。**
+- **窖藏离线合并（多标签页）**：多个标签页同时登记同一窖藏批次或改环境读数时，改动先写入 `cellarDrafts` 草稿，再逐条独立事务三路合并（`utils/cellarSync.ts`）：
+  - 同一条按**修订号**判新旧（大者胜，相等再比 `updatedAt`），对端未改则快进；
+  - 双方改了**不同字段**自动合并到一起；改了**同一字段且取值不同**则主版本留较新一方，另一方以 `forkOf` 关联保留两版，列表中标记「冲突留版」可查看；
+  - 库内独有的记录直接补入；全量快照导入时窖藏表同样逐条合并而非整批覆盖；
+  - 草稿合并失败（容量不足 / 读数越界 / 批次缺失）只标记该条失败，**草稿保留**并在页面「离线草稿」面板单条或一键重试；断网恢复（`online` 事件）、收到其它标签页 `BroadcastChannel` 通知或首屏载入时会自动重放待提交草稿。
+- **提交前校验与派生重算**：入窖 / 读数提交前核对温湿度硬边界（-10~50℃ / 0~100%，越界拒绝）与容器窖容余量（陶罐 500 / 锡罐 200 / 竹筒 120，按在窖批次数量合计，容量不足拒绝入窖）；有效读数改动成功后修订号自增，窖藏状态、临近出窖与环境告警均为随 `liveQuery` 的派生值自动重算，全量导出 JSON 额外携带按当前读数重算的 `cellarStatus` 窖藏状态汇总。
 - **首屏自动播种**：`main.ts` 在挂载前调用 `initDatabase()`，其中包含 `if ((await db.formulas.count()) === 0) { await seedDatabase() }`，写入 3 款香方 → 7 条配比 / 2 个和香批次 → 2 条窖藏 / 2 条品香（香方 → 配比/批次 → 窖藏/品香 三层互相引用）。播种使用固定 id + `bulkPut`，**幂等**，重复调用不会产生重复数据。
 - **localStorage 元数据**：`gbincense:db-version`（结构版本）、`gbincense:last-backup-at`（上次导出时间）、`gbincense:ui-prefs`（当前香方、配比与窖藏排序方式）。
-- **导出 / 导入**：`utils/export.ts` 提供 `exportFormulaJson()`（单方）与 `exportSnapshotJson()`（全量），导入前用 `validateFormulaJson()` / `validateSnapshotJson()` 做字段与枚举校验，校验失败会提示具体错误且不写库。
+- **导出 / 导入**：`utils/export.ts` 提供 `exportFormulaJson()`（单方）与 `exportSnapshotJson()`（全量），导入前用 `validateFormulaJson()` / `validateSnapshotJson()` 做字段与枚举校验，校验失败会提示具体错误且不写库；旧版导出文件中的窖藏记录缺 `revision` 时按入窖日期就地补迁移，全量导入窖藏表走逐条离线合并且不覆盖本地独有版本。全量快照额外携带 `cellarStatus`（按当前在窖读数重算的窖藏状态汇总）。
 - **无命名卷、无后端**：数据只在本浏览器，清理浏览器站点数据即清空；应用内提供「重置演示数据」按钮可恢复样例档案。
 
 ---
