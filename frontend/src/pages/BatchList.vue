@@ -147,7 +147,7 @@ const rows = computed<BatchRow[]>(() =>
       batch.snapshot.reduce((sum, item) => sum + item.ratio, 0),
       2
     )
-    const cellars = cellarStore.cellarsOfBatch(batch.id)
+    const cellars = cellarStore.cellarsOfBatch(batch.id).filter((cellar) => !cellar.conflictOf)
     return {
       batch,
       formulaName: formulaStore.formulaName(batch.formulaId),

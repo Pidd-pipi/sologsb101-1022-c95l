@@ -57,7 +57,7 @@ const navItems = computed<NavItem[]>(() => [
     path: '/cellar',
     label: '窖藏陈化',
     icon: Coin,
-    badge: String(cellarStore.alerts.length),
+    badge: String(cellarStore.alerts.length + cellarStore.conflictCount),
     hint: '环境记录与出窖提醒'
   },
   {

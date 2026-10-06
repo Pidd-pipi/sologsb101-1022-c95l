@@ -3,11 +3,11 @@ import type { Formula } from '@/types/formula'
 import type { Material } from '@/types/material'
 import type { Proportion } from '@/types/proportion'
 import type { Batch } from '@/types/batch'
-import type { Cellar } from '@/types/cellar'
+import { revisionFromStartDate, type Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -106,6 +106,23 @@ export class IncenseDatabase extends Dexie {
             if (typeof tasting.lastingMin !== 'number' || Number.isNaN(tasting.lastingMin)) {
               tasting.lastingMin = 0
             }
+          })
+      })
+    // v3：窖藏表补修订号与冲突副本索引；旧数据缺修订号时从入窖日期折算迁移
+    this.version(DB_VERSION)
+      .stores({
+        cellars: 'id, batchId, startDate, endDate, state, updatedAt, revision, conflictOf'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<Cellar>('cellars')
+          .toCollection()
+          .modify((cellar) => {
+            if (typeof cellar.revision !== 'number' || !Number.isFinite(cellar.revision) || cellar.revision < 1) {
+              cellar.revision = revisionFromStartDate(cellar.startDate)
+            }
+            if (typeof cellar.conflictOf !== 'string') delete cellar.conflictOf
+            if (typeof cellar.conflictNote !== 'string') delete cellar.conflictNote
           })
       })
   }
@@ -216,6 +233,14 @@ export async function exportSnapshot(): Promise<IncenseSnapshot> {
 /** 按主键 bulkPut 写入快照；overwrite 为 true 时先清空全部表 */
 export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = false): Promise<void> {
   if (overwrite) await clearAllTables()
+  // 旧版本导出的窖藏没有修订号，落库前按入窖日期补齐，保证多标签页合并可用
+  const cellars = snapshot.cellars.map((cellar) => ({
+    ...cellar,
+    revision:
+      typeof cellar.revision === 'number' && cellar.revision > 0
+        ? cellar.revision
+        : revisionFromStartDate(cellar.startDate)
+  }))
   await db.transaction(
     'rw',
     [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
@@ -224,7 +249,7 @@ export async function importSnapshot(snapshot: IncenseSnapshot, overwrite = fals
       await db.materials.bulkPut(snapshot.materials)
       await db.proportions.bulkPut(snapshot.proportions)
       await db.batches.bulkPut(snapshot.batches)
-      await db.cellars.bulkPut(snapshot.cellars)
+      await db.cellars.bulkPut(cellars)
       await db.tastings.bulkPut(snapshot.tastings)
     }
   )
@@ -414,6 +439,7 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 58,
       container: '陶罐',
       state: '窖藏中',
+      revision: revisionFromStartDate('2024-04-05'),
       updatedAt: now
     },
     {
@@ -425,6 +451,7 @@ export async function seedDatabase(): Promise<void> {
       humidityPct: 62,
       container: '锡罐',
       state: '已出窖',
+      revision: revisionFromStartDate('2024-06-20'),
       updatedAt: now
     }
   ]

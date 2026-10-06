@@ -43,10 +43,9 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`，`noUnusedLocals` / `noUnusedParameters` 均开启） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、抽屉、对话框、表单、滑块、提示 |
 | 构建工具 | Vite 6 | 开发服务器端口 22822 |
-| 状态管理 | Pinia 2（setup store） | `formulaStore` / `materialStore` / `proportionStore` / `cellarStore` |
+| 状态管理 | Pinia 2（setup store） | `formulaStore` / `materialStore` / `proportionStore` / `cellarStore` / `cellarDraftStore`（离线草稿） |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files $uri $uri/ /index.html` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbincense`，含结构版本号与 `upgrade` 迁移逻辑 |
-| 拖拽排序 | HTML5 原生 `draggable` + `dragstart/dragover/drop` | 未引入 `vuedraggable` / `dnd-kit` 等额外依赖 |
+| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbincense`，含结构版本号与 `upgrade` 迁移逻辑 || 拖拽排序 | HTML5 原生 `draggable` + `dragstart/dragover/drop` | 未引入 `vuedraggable` / `dnd-kit` 等额外依赖 |
 | 容器化 | Docker 多阶段：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
 
 ---
@@ -87,13 +86,13 @@ sologsb101-1022/
         ├── env.d.ts
         ├── styles/main.css
         ├── types/              # formula.ts material.ts proportion.ts batch.ts cellar.ts tasting.ts
-        ├── stores/             # formulaStore.ts materialStore.ts proportionStore.ts cellarStore.ts
-        ├── components/common/  # GradeTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
+        ├── stores/             # formulaStore.ts materialStore.ts proportionStore.ts cellarStore.ts cellarDraftStore.ts
+        ├── components/common/  # GradeTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue DraftPanel.vue
         ├── hooks/              # useProportion.ts useIdbTable.ts
         ├── pages/              # FormulaList.vue MaterialLib.vue ProportionBoard.vue
         │                       # BatchList.vue CellarView.vue TastingBoard.vue
         ├── router/index.ts
-        └── utils/              # ratio.ts db.ts export.ts
+        └── utils/              # ratio.ts db.ts export.ts cellarMerge.ts
 ```
 
 | 路由 | 页面 | 主要职责 | 消费模型 |
@@ -112,7 +111,7 @@ sologsb101-1022/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbincense`（`frontend/src/utils/db.ts` 中的 `new IncenseDatabase()` → `super('gbincense')`）。
-- **结构版本号**：`export const DB_VERSION = 2`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
+- **结构版本号**：`export const DB_VERSION = 3`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
 
 | 表 | 主键与索引 | 说明 |
 | --- | --- | --- |
@@ -123,12 +122,25 @@ sologsb101-1022/
 | `cellars` | `id, batchId, startDate, endDate, state, updatedAt` | 窖藏批次与环境读数 |
 | `tastings` | `id, batchId, tastedAt, smokeScore, updatedAt` | 品香评鉴 |
 
-- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(DB_VERSION).stores({...}).upgrade(async (tx) => {...})` 为真实迁移，会 `toCollection().modify(...)` 改写历史数据：
+- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(2)...upgrade(...)` 回填历史脏数据：
   1. 配比表补齐 `seq`（按 `formulaId` 分组顺序编号）与 `updatedAt`；
   2. 批次表补齐 `snapshot` 数组与 `snapshotAt`；
   3. 品香表补齐 `lastingMin` 默认值。
+  `version(3)` 给窖藏表补 `revision` / `conflictOf` 索引；**旧窖藏数据缺修订号时按入窖日期折算迁移**（距 1970-01-01 的天数，随日期单调递增），导入的旧版 JSON 落库前同样补齐。
 - **首屏自动播种**：`main.ts` 在挂载前调用 `initDatabase()`，其中包含 `if ((await db.formulas.count()) === 0) { await seedDatabase() }`，写入 3 款香方 → 7 条配比 / 2 个和香批次 → 2 条窖藏 / 2 条品香（香方 → 配比/批次 → 窖藏/品香 三层互相引用）。播种使用固定 id + `bulkPut`，**幂等**，重复调用不会产生重复数据。
-- **localStorage 元数据**：`gbincense:db-version`（结构版本）、`gbincense:last-backup-at`（上次导出时间）、`gbincense:ui-prefs`（当前香方、配比与窖藏排序方式）。
+- **localStorage 元数据**：`gbincense:db-version`（结构版本）、`gbincense:last-backup-at`（上次导出时间）、`gbincense:ui-prefs`（当前香方、配比与窖藏排序方式）、`gbincense:cellar-drafts`（窖藏离线草稿）。
+
+### 多标签页窖藏离线合并
+
+多个标签页同时编辑同一窖藏批次（入窖登记 / 温湿度读数 / 出窖）时，提交统一走「修订号 + 三路合并」（`utils/cellarMerge.ts`），不再整批覆盖：
+
+- **同一条按修订号和时间留较新值**：远端未被别人动过则快进提交；远端修订号更老则本地覆盖；远端更新则逐字段（base / 草稿 / 远端）三路对比。
+- **没冲突的补进来**：只被一方改过的字段、或双方改成相同值的字段自动合入。
+- **双方都改过且值不同**：较新一版（先比 `revision`，相同再比 `updatedAt`）作为主记录，另一版原样留为 `conflictOf` 并行副本，**两版都在**，列表红色标记并提供「采用此版 / 放弃此版」人工处理。
+- **同一批次被多标签页重复入窖**：后到的登记保留为并行版本，不重复占容器位。
+- **失败后草稿还在并能重试**：提交前校验不通过（容量不足、温湿度越界）或写库异常时，草稿持久化在 localStorage（`stores/cellarDraftStore.ts` + 组件 `DraftPanel.vue`），页面顶部显示失败原因，可重试、继续编辑或丢弃。
+- **提交前核对**：容器容量（陶罐 20 / 锡罐 12 / 竹筒 8，冲突副本不占位）不足直接拒绝入窖；温湿度硬边界（-10~50℃ / 0~100%）拒绝提交，建议区间（18~26℃ / 50~70%）仅告警；对话框实时显示「已占/容量」余量。
+- **有效读数改动即重算**：提交成功后刷新窖藏状态、临近出窖告警、在窖均温均湿与环境超限列表（`lastRecalcAt` 节拍），导出直接读实时库，因此告警与导出始终与最新读数一致。
 - **导出 / 导入**：`utils/export.ts` 提供 `exportFormulaJson()`（单方）与 `exportSnapshotJson()`（全量），导入前用 `validateFormulaJson()` / `validateSnapshotJson()` 做字段与枚举校验，校验失败会提示具体错误且不写库。
 - **无命名卷、无后端**：数据只在本浏览器，清理浏览器站点数据即清空；应用内提供「重置演示数据」按钮可恢复样例档案。
 

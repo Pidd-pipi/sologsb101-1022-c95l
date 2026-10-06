@@ -19,7 +19,14 @@ import {
 import { MATERIAL_GRADES, PROCESS_METHODS, type Material, type MaterialGrade, type ProcessMethod } from '@/types/material'
 import { PROPORTION_ROLES, type Proportion, type ProportionRole } from '@/types/proportion'
 import { FORMING_METHODS, type Batch, type FormingMethod } from '@/types/batch'
-import { CELLAR_CONTAINERS, CELLAR_STATES, type Cellar, type CellarState, type CellarContainer } from '@/types/cellar'
+import {
+  CELLAR_CONTAINERS,
+  CELLAR_STATES,
+  revisionFromStartDate,
+  type Cellar,
+  type CellarState,
+  type CellarContainer
+} from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
 
 /** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香 */
@@ -329,15 +336,21 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       errors.push(`cellars[${index}] batchId 无法对应到本次导入的批次`)
       return
     }
+    const startDate = asString(raw.startDate, new Date().toISOString().slice(0, 10))
     cellars.push({
       id: asString(raw.id, createId('cellar')),
       batchId,
-      startDate: asString(raw.startDate, new Date().toISOString().slice(0, 10)),
+      startDate,
       endDate: asString(raw.endDate, new Date().toISOString().slice(0, 10)),
       temperatureC: asNumber(raw.temperatureC, 22),
       humidityPct: asNumber(raw.humidityPct, 60),
       container: pickEnum<CellarContainer>(raw.container, CELLAR_CONTAINER_SET, '陶罐'),
       state: pickEnum<CellarState>(raw.state, CELLAR_STATE_SET, '窖藏中'),
+      // 旧版本导出文件缺修订号：按入窖日期补齐后才能参与多标签页合并
+      revision:
+        typeof raw.revision === 'number' && raw.revision > 0
+          ? Math.floor(raw.revision)
+          : revisionFromStartDate(startDate),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
